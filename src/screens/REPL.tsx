@@ -1,4 +1,4 @@
-import { c as _c } from "react/compiler-runtime";
+import { c as _c } from "react-compiler-runtime";
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle';
 import { spawnSync } from 'child_process';
@@ -217,6 +217,7 @@ import { IdeOnboardingDialog } from '../components/IdeOnboardingDialog.js';
 import { EffortCallout, shouldShowEffortCallout } from '../components/EffortCallout.js';
 import type { EffortValue } from '../utils/effort.js';
 import { RemoteCallout } from '../components/RemoteCallout.js';
+import { getAPIProvider } from '../utils/model/providers.js';
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
 const AntModelSwitchCallout = "external" === 'ant' ? require('../components/AntModelSwitchCallout.js').AntModelSwitchCallout : null;
 const shouldShowAntModelSwitch = "external" === 'ant' ? require('../components/AntModelSwitchCallout.js').shouldShowModelSwitchCallout : (): boolean => false;
@@ -606,12 +607,6 @@ export function REPL({
   const disableMessageActions = feature('MESSAGE_ACTIONS') ?
   // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
   useMemo(() => isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS), []) : false;
-
-  // Log REPL mount/unmount lifecycle
-  useEffect(() => {
-    logForDebugging(`[REPL:mount] REPL mounted, disabled=${disabled}`);
-    return () => logForDebugging(`[REPL:unmount] REPL unmounting`);
-  }, [disabled]);
 
   // Agent definition is state so /resume can update it mid-session
   const [mainThreadAgentDefinition, setMainThreadAgentDefinition] = useState(initialMainThreadAgentDefinition);
@@ -2681,7 +2676,7 @@ export function REPL({
     // useDeferredHookMessages) and attachment messages (appended by
     // processTextPrompt) — both pushed length past 1 on turn one, so the
     // title silently fell through to the "Claude Code" default.
-    if (!titleDisabled && !sessionTitle && !agentTitle && !haikuTitleAttemptedRef.current) {
+    if (getAPIProvider() === 'firstParty' && !titleDisabled && !sessionTitle && !agentTitle && !haikuTitleAttemptedRef.current) {
       const firstUserMessage = newMessages.find(m => m.type === 'user' && !m.isMeta);
       const text = firstUserMessage?.type === 'user' ? getContentText(firstUserMessage.message.content) : null;
       // Skip synthetic breadcrumbs — slash-command output, prompt-skill

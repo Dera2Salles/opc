@@ -1,4 +1,8 @@
 import { feature } from 'bun:bundle';
+import {
+  resolveCodexApiCredentials,
+  resolveProviderRequest,
+} from '../services/api/providerConfig.js'
 
 // Bugfix for corepack auto-pinning, which adds yarnpkg to peoples' package.jsons
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
@@ -25,6 +29,59 @@ if (feature('ABLATION_BASELINE') && process.env.CLAUDE_CODE_ABLATION_BASELINE) {
   }
 }
 
+function isEnvTruthy(value: string | undefined): boolean {
+  if (!value) return false
+  const normalized = value.trim().toLowerCase()
+  return normalized !== '' && normalized !== '0' && normalized !== 'false' && normalized !== 'no'
+}
+
+function isLocalProviderUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+  try {
+    const parsed = new URL(baseUrl)
+    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+function validateProviderEnvOrExit(): void {
+  if (!isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)) {
+    return
+  }
+
+  const request = resolveProviderRequest({
+    model: process.env.OPENAI_MODEL,
+    baseUrl: process.env.OPENAI_BASE_URL,
+  })
+
+  if (process.env.OPENAI_API_KEY === 'SUA_CHAVE') {
+    console.error('Invalid OPENAI_API_KEY: placeholder value SUA_CHAVE detected. Set a real key or unset for local providers.')
+    process.exit(1)
+  }
+
+  if (request.transport === 'codex_responses') {
+    const credentials = resolveCodexApiCredentials()
+    if (!credentials.apiKey) {
+      const authHint = credentials.authPath
+        ? ` or put auth.json at ${credentials.authPath}`
+        : ''
+      console.error(`Codex auth is required for ${request.requestedModel}. Set CODEX_API_KEY${authHint}.`)
+      process.exit(1)
+    }
+    if (!credentials.accountId) {
+      console.error('Codex auth is missing chatgpt_account_id. Re-login with Codex or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID.')
+      process.exit(1)
+    }
+    return
+  }
+
+  if (!process.env.OPENAI_API_KEY && !isLocalProviderUrl(request.baseUrl)) {
+    console.error('OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.')
+    process.exit(1)
+  }
+}
+
 /**
  * Bootstrap entrypoint - checks for special flags before loading the full CLI.
  * All imports are dynamic to minimize module evaluation for fast paths.
@@ -37,9 +94,11 @@ async function main(): Promise<void> {
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
     // MACRO.VERSION is inlined at build time
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log(`${MACRO.VERSION} (Claude Code)`);
+    console.log(`${MACRO.DISPLAY_VERSION ?? MACRO.VERSION} (Open Claude)`);
     return;
   }
+
+  validateProviderEnvOrExit()
 
   // For all other paths, load the startup profiler
   const {
@@ -285,10 +344,12 @@ async function main(): Promise<void> {
   }
 
   // No special flags detected, load and run the full CLI
-  const {
-    startCapturingEarlyInput
-  } = await import('../utils/earlyInput.js');
-  startCapturingEarlyInput();
+  if (process.env.OPENCLAUDE_ENABLE_EARLY_INPUT === '1') {
+    const {
+      startCapturingEarlyInput
+    } = await import('../utils/earlyInput.js');
+    startCapturingEarlyInput();
+  }
   profileCheckpoint('cli_before_main_import');
   const {
     main: cliMain
