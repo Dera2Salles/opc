@@ -1,5 +1,6 @@
-// biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+// biome-ignore-all assist/source/organizeImports: internal-only import markers must not be reordered
 import { getInitialMainLoopModel } from '../../bootstrap/state.js'
+import { getAdditionalModelOptionsCacheScope } from '../../services/api/providerConfig.js'
 import {
   isClaudeAISubscriber,
   isMaxSubscriber,
@@ -32,6 +33,8 @@ import {
 } from './model.js'
 import { has1mContext } from '../context.js'
 import { getGlobalConfig } from '../config.js'
+import { getActiveOpenAIModelOptionsCache } from '../providerProfiles.js'
+import { getCachedOllamaModelOptions, isOllamaProvider } from './ollamaModels.js'
 
 // @[MODEL LAUNCH]: Update all the available and default model option strings below.
 
@@ -40,6 +43,25 @@ export type ModelOption = {
   label: string
   description: string
   descriptionForModel?: string
+}
+
+function getScopedAdditionalModelOptions(): ModelOption[] {
+  const config = getGlobalConfig()
+  const activeScope = getAdditionalModelOptionsCacheScope()
+
+  if (!activeScope) {
+    return []
+  }
+
+  if (config.additionalModelOptionsCacheScope !== undefined) {
+    return config.additionalModelOptionsCacheScope === activeScope
+      ? (config.additionalModelOptionsCache ?? [])
+      : []
+  }
+
+  return activeScope === 'firstParty'
+    ? (config.additionalModelOptionsCache ?? [])
+    : []
 }
 
 export function getDefaultOptionForUser(fastMode = false): ModelOption {
@@ -268,29 +290,108 @@ function getOpusPlanOption(): ModelOption {
 
 function getCodexPlanOption(): ModelOption {
   return {
-    value: 'codexplan',
-    label: 'Codex Plan',
+    value: 'gpt-5.4',
+    label: 'gpt-5.4',
     description: 'GPT-5.4 on the Codex backend with high reasoning',
   }
 }
 
 function getCodexSparkOption(): ModelOption {
   return {
-    value: 'codexspark',
-    label: 'Codex Spark',
+    value: 'gpt-5.3-codex-spark',
+    label: 'gpt-5.3-codex-spark',
     description: 'GPT-5.3 Codex Spark on the Codex backend for fast tool loops',
   }
+}
+
+function getCodexModelOptions(): ModelOption[] {
+  return [
+    {
+      value: 'gpt-5.4',
+      label: 'gpt-5.4',
+      description: 'GPT-5.4 with high reasoning',
+    },
+    {
+      value: 'gpt-5.3-codex',
+      label: 'gpt-5.3-codex',
+      description: 'GPT-5.3 Codex with high reasoning',
+    },
+    {
+      value: 'gpt-5.3-codex-spark',
+      label: 'gpt-5.3-codex-spark',
+      description: 'GPT-5.3 Codex Spark for fast tool loops',
+    },
+    {
+      value: 'codexspark',
+      label: 'codexspark',
+      description: 'GPT-5.3 Codex Spark alias for fast tool loops',
+    },
+    {
+      value: 'gpt-5.2-codex',
+      label: 'gpt-5.2-codex',
+      description: 'GPT-5.2 Codex with high reasoning',
+    },
+    {
+      value: 'gpt-5.1-codex-max',
+      label: 'gpt-5.1-codex-max',
+      description: 'GPT-5.1 Codex Max for deep reasoning',
+    },
+    {
+      value: 'gpt-5.1-codex-mini',
+      label: 'gpt-5.1-codex-mini',
+      description: 'GPT-5.1 Codex Mini - faster, cheaper',
+    },
+    {
+      value: 'gpt-5.4-mini',
+      label: 'gpt-5.4-mini',
+      description: 'GPT-5.4 Mini - faster, cheaper',
+    },
+  ]
 }
 
 // @[MODEL LAUNCH]: Update the model picker lists below to include/reorder options for the new model.
 // Each user tier (ant, Max/Team Premium, Pro/Team Standard/Enterprise, PAYG 1P, PAYG 3P) has its own list.
 function getModelOptionsBase(fastMode = false): ModelOption[] {
+  if (getAPIProvider() === 'github') {
+    const githubModel = process.env.OPENAI_MODEL?.trim() || 'github:copilot'
+    return [
+      getDefaultOptionForUser(fastMode),
+      {
+        value: githubModel,
+        label: githubModel,
+        description: 'GitHub Models default',
+      },
+    ]
+  }
+
+  // When using Ollama, show models from the Ollama server instead of Claude models
+  if (getAPIProvider() === 'openai' && isOllamaProvider()) {
+    const defaultOption = getDefaultOptionForUser(fastMode)
+    const ollamaModels = getCachedOllamaModelOptions()
+    if (ollamaModels.length > 0) {
+      return [defaultOption, ...ollamaModels]
+    }
+    // Fallback: if models not yet fetched, show current model instead of Claude models
+    const currentModel = getUserSpecifiedModelSetting() ?? getInitialMainLoopModel()
+    if (currentModel != null) {
+      return [
+        defaultOption,
+        {
+          value: currentModel,
+          label: currentModel,
+          description: 'Currently configured Ollama model',
+        },
+      ]
+    }
+    return [defaultOption]
+  }
+
   if (process.env.USER_TYPE === 'ant') {
     // Build options from antModels config
     const antModelOptions: ModelOption[] = getAntModels().map(m => ({
       value: m.alias,
       label: m.label,
-      description: m.description ?? `[ANT-ONLY] ${m.label} (${m.model})`,
+      description: m.description ?? `[internal] ${m.label} (${m.model})`,
     }))
 
     return [
@@ -339,6 +440,16 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
     return standardOptions
   }
 
+  if (getAdditionalModelOptionsCacheScope()?.startsWith('openai:')) {
+    const activeOpenAIOptions = getActiveOpenAIModelOptionsCache()
+    return [
+      getDefaultOptionForUser(fastMode),
+      ...(activeOpenAIOptions.length > 0
+        ? activeOpenAIOptions
+        : getScopedAdditionalModelOptions()),
+    ]
+  }
+
   // PAYG 1P API: Default (Sonnet) + Sonnet 1M + Opus 4.6 + Opus 1M + Haiku
   if (getAPIProvider() === 'firstParty') {
     const payg1POptions = [getDefaultOptionForUser(fastMode)]
@@ -360,8 +471,9 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
   // PAYG 3P: Default (Sonnet 4.5) + Sonnet (3P custom) or Sonnet 4.6/1M + Opus (3P custom) or Opus 4.1/Opus 4.6/Opus1M + Haiku + Opus 4.1
   const payg3pOptions = [getDefaultOptionForUser(fastMode)]
 
-  if (getAPIProvider() === 'openai') {
-    payg3pOptions.push(getCodexPlanOption(), getCodexSparkOption())
+  // Add Codex models for openai and codex providers
+  if (getAPIProvider() === 'openai' || getAPIProvider() === 'codex') {
+    payg3pOptions.push(...getCodexModelOptions())
   }
 
   const customSonnet = getCustomSonnetOption()
@@ -479,6 +591,10 @@ function getKnownModelOption(model: string): ModelOption | null {
 }
 
 export function getModelOptions(fastMode = false): ModelOption[] {
+  if (getAPIProvider() === 'github') {
+    return filterModelOptionsByAllowlist(getModelOptionsBase(fastMode))
+  }
+
   const options = getModelOptionsBase(fastMode)
 
   // Add the custom model from the ANTHROPIC_CUSTOM_MODEL_OPTION env var
@@ -497,7 +613,7 @@ export function getModelOptions(fastMode = false): ModelOption[] {
   }
 
   // Append additional model options fetched during bootstrap
-  for (const opt of getGlobalConfig().additionalModelOptionsCache ?? []) {
+  for (const opt of getScopedAdditionalModelOptions()) {
     if (!options.some(existing => existing.value === opt.value)) {
       options.push(opt)
     }
@@ -517,9 +633,9 @@ export function getModelOptions(fastMode = false): ModelOption[] {
     return filterModelOptionsByAllowlist(options)
   } else if (customModel === 'opusplan') {
     return filterModelOptionsByAllowlist([...options, getOpusPlanOption()])
-  } else if (customModel === 'codexplan') {
+  } else if (customModel === 'gpt-5.4') {
     return filterModelOptionsByAllowlist([...options, getCodexPlanOption()])
-  } else if (customModel === 'codexspark') {
+  } else if (customModel === 'gpt-5.3-codex-spark') {
     return filterModelOptionsByAllowlist([...options, getCodexSparkOption()])
   } else if (customModel === 'opus' && getAPIProvider() === 'firstParty') {
     return filterModelOptionsByAllowlist([
@@ -554,11 +670,23 @@ export function getModelOptions(fastMode = false): ModelOption[] {
  */
 function filterModelOptionsByAllowlist(options: ModelOption[]): ModelOption[] {
   const settings = getSettings_DEPRECATED() || {}
-  if (!settings.availableModels) {
-    return options // No restrictions
-  }
-  return options.filter(
+  const filtered = !settings.availableModels
+    ? options // No restrictions
+    : options.filter(
     opt =>
       opt.value === null || (opt.value !== null && isModelAllowed(opt.value)),
   )
+
+  // Select state uses option values as identity keys. If two entries share the
+  // same value (e.g. provider-specific aliases collapsing to one model ID),
+  // navigation/focus can become inconsistent and appear as duplicate rendering.
+  const seen = new Set<string>()
+  return filtered.filter(opt => {
+    const key = String(opt.value)
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 }

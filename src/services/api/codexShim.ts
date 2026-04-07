@@ -1,7 +1,9 @@
+import { APIError } from '@anthropic-ai/sdk'
 import type {
   ResolvedCodexCredentials,
   ResolvedProviderRequest,
 } from './providerConfig.js'
+import { sanitizeSchemaForOpenAICompat } from './openaiSchemaSanitizer.js'
 
 export interface AnthropicUsage {
   input_tokens: number
@@ -83,7 +85,7 @@ function makeUsage(usage?: {
 }
 
 function makeMessageId(): string {
-  return `msg_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+  return `msg_${crypto.randomUUID().replace(/-/g, '')}`
 }
 
 function normalizeToolUseId(toolUseId: string | undefined): {
@@ -234,7 +236,10 @@ export function convertAnthropicMessagesToResponsesInput(
           items.push({
             type: 'function_call_output',
             call_id: callId,
-            output: convertToolResultToText(toolResult.content),
+            output: (() => {
+              const out = convertToolResultToText(toolResult.content)
+              return toolResult.is_error ? `Error: ${out}` : out
+            })(),
           })
         }
 
@@ -259,7 +264,8 @@ export function convertAnthropicMessagesToResponsesInput(
 
     if (role === 'assistant') {
       const textBlocks = Array.isArray(content)
-        ? content.filter((block: { type?: string }) => block.type !== 'tool_use')
+        ? content.filter((block: { type?: string }) =>
+            block.type !== 'tool_use' && block.type !== 'thinking')
         : content
       const parts = convertContentBlocksToResponsesParts(textBlocks, 'assistant')
       if (parts.length > 0) {
@@ -295,20 +301,95 @@ export function convertAnthropicMessagesToResponsesInput(
   )
 }
 
+/**
+ * Recursively enforces Codex strict-mode constraints on a JSON schema:
+ * - Every `object` type gets `additionalProperties: false`
+ * - All property keys are listed in `required`
+ * - Nested schemas (properties, items, anyOf/oneOf/allOf) are processed too
+ */
+function enforceStrictSchema(schema: unknown): Record<string, unknown> {
+  const record = sanitizeSchemaForOpenAICompat(schema)
+
+  // Codex Responses rejects JSON Schema's standard `uri` string format.
+  // Keep URL validation in the tool layer and send a plain string here.
+  if (record.format === 'uri') {
+    delete record.format
+  }
+
+  if (record.type === 'object') {
+    // OpenAI structured outputs completely forbid dynamic additionalProperties.
+    // They must be set to false unconditionally.
+    record.additionalProperties = false
+
+    if (
+      record.properties &&
+      typeof record.properties === 'object' &&
+      !Array.isArray(record.properties)
+    ) {
+      const props = record.properties as Record<string, unknown>
+      const allKeys = Object.keys(props)
+
+      const enforcedProps: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(props)) {
+        const strictValue = enforceStrictSchema(value)
+        // If the resulting schema is an empty object (no properties), OpenAI structured outputs will likely
+        // strip it silently and then complain about a 'required' mismatch if it remains in the required list.
+        // E.g. z.record() objects (like AskUserQuestion.answers) lose their schema due to additionalProperties 
+        // restrictions. We can safely drop these from the schema sent to the LLM.
+        if (
+          strictValue &&
+          typeof strictValue === 'object' &&
+          strictValue.type === 'object' &&
+          strictValue.additionalProperties === false &&
+          (!strictValue.properties || Object.keys(strictValue.properties).length === 0)
+        ) {
+          continue
+        }
+        enforcedProps[key] = strictValue
+      }
+      record.properties = enforcedProps
+      record.required = Object.keys(enforcedProps)
+    } else {
+      // No properties — empty required array
+      record.required = []
+    }
+  }
+
+  // Recurse into array items
+  if ('items' in record) {
+    if (Array.isArray(record.items)) {
+      record.items = (record.items as unknown[]).map(item => enforceStrictSchema(item))
+    } else {
+      record.items = enforceStrictSchema(record.items)
+    }
+  }
+
+  // Recurse into combinators
+  for (const key of ['anyOf', 'oneOf', 'allOf'] as const) {
+    if (key in record && Array.isArray(record[key])) {
+      record[key] = (record[key] as unknown[]).map(item => enforceStrictSchema(item))
+    }
+  }
+
+  return record
+}
+
 export function convertToolsToResponsesTools(
   tools: Array<{ name?: string; description?: string; input_schema?: Record<string, unknown> }>,
 ): ResponsesTool[] {
   return tools
     .filter(tool => tool.name && tool.name !== 'ToolSearchTool')
     .map(tool => {
-      const parameters = tool.input_schema ?? { type: 'object', properties: {} }
+      const rawParameters = tool.input_schema ?? { type: 'object', properties: {} }
+      // Codex requires strict schemas: all properties must be required
+      const parameters = enforceStrictSchema(rawParameters)
 
       return {
         type: 'function',
         name: tool.name ?? 'tool',
         description: tool.description ?? '',
         parameters,
-        ...(isStrictResponsesSchema(parameters) ? { strict: true } : {}),
+        strict: true,
       }
     })
 }
@@ -376,6 +457,7 @@ function convertToolChoice(toolChoice: unknown): unknown {
   if (!choice?.type) return undefined
   if (choice.type === 'auto') return 'auto'
   if (choice.type === 'any') return 'required'
+  if (choice.type === 'none') return 'none'
   if (choice.type === 'tool' && choice.name) {
     return {
       type: 'function',
@@ -443,11 +525,18 @@ export async function performCodexRequest(options: {
     body.reasoning = options.request.reasoning
   }
 
-  if (options.params.temperature !== undefined) {
-    body.temperature = options.params.temperature
-  }
-  if (options.params.top_p !== undefined) {
-    body.top_p = options.params.top_p
+  const isTargetModel =
+    options.request.resolvedModel?.toLowerCase().includes('gpt') ||
+    options.request.resolvedModel?.toLowerCase().includes('codex')
+
+  // Only pass temperature and top_p if it's not a GPT/Codex model that rejects them
+  if (!isTargetModel) {
+    if (options.params.temperature !== undefined) {
+      body.temperature = options.params.temperature
+    }
+    if (options.params.top_p !== undefined) {
+      body.top_p = options.params.top_p
+    }
   }
 
   const headers: Record<string, string> = {
@@ -469,7 +558,13 @@ export async function performCodexRequest(options: {
 
   if (!response.ok) {
     const errorBody = await response.text().catch(() => 'unknown error')
-    throw new Error(`Codex API error ${response.status}: ${errorBody}`)
+    let errorResponse: object | undefined
+    try { errorResponse = JSON.parse(errorBody) } catch { /* raw text */ }
+    throw APIError.generate(
+      response.status, errorResponse,
+      `Codex API error ${response.status}: ${errorBody}`,
+      response.headers as unknown as Headers,
+    )
   }
 
   return response
@@ -549,11 +644,9 @@ export async function collectCodexCompletedResponse(
 
   for await (const event of readSseEvents(response)) {
     if (event.event === 'response.failed') {
-      throw new Error(
-        event.data?.response?.error?.message ??
-          event.data?.error?.message ??
-          'Codex response failed',
-      )
+      const msg = event.data?.response?.error?.message ??
+        event.data?.error?.message ?? 'Codex response failed'
+      throw APIError.generate(500, undefined, msg, new Headers())
     }
 
     if (
@@ -566,7 +659,10 @@ export async function collectCodexCompletedResponse(
   }
 
   if (!completedResponse) {
-    throw new Error('Codex response ended without a completed payload')
+    throw APIError.generate(
+      500, undefined, 'Codex response ended without a completed payload',
+      new Headers(),
+    )
   }
 
   return completedResponse
@@ -722,11 +818,9 @@ export async function* codexStreamToAnthropic(
     }
 
     if (event.event === 'response.failed') {
-      throw new Error(
-        payload?.response?.error?.message ??
-          payload?.error?.message ??
-          'Codex response failed',
-      )
+      const msg = payload?.response?.error?.message ??
+        payload?.error?.message ?? 'Codex response failed'
+      throw APIError.generate(500, undefined, msg, new Headers())
     }
   }
 

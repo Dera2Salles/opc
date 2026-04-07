@@ -1,4 +1,4 @@
-// biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+// biome-ignore-all assist/source/organizeImports: internal-only import markers must not be reordered
 import addDir from './commands/add-dir/index.js'
 import autofixPr from './commands/autofix-pr/index.js'
 import backfillSessions from './commands/backfill-sessions/index.js'
@@ -17,8 +17,10 @@ import config from './commands/config/index.js'
 import { context, contextNonInteractive } from './commands/context/index.js'
 import cost from './commands/cost/index.js'
 import diff from './commands/diff/index.js'
+import dream from './commands/dream/index.js'
 import ctx_viz from './commands/ctx_viz/index.js'
 import doctor from './commands/doctor/index.js'
+import onboardGithub from './commands/onboard-github/index.js'
 import memory from './commands/memory/index.js'
 import help from './commands/help/index.js'
 import ide from './commands/ide/index.js'
@@ -57,6 +59,7 @@ import usage from './commands/usage/index.js'
 import theme from './commands/theme/index.js'
 import vim from './commands/vim/index.js'
 import { feature } from 'bun:bundle'
+import { isBuddyEnabled } from './buddy/feature.js'
 // Dead code elimination: conditional imports
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactive =
@@ -115,7 +118,7 @@ const forkCmd = feature('FORK_SUBAGENT')
       require('./commands/fork/index.js') as typeof import('./commands/fork/index.js')
     ).default
   : null
-const buddy = feature('BUDDY')
+const buddy = isBuddyEnabled()
   ? (
       require('./commands/buddy/index.js') as typeof import('./commands/buddy/index.js')
     ).default
@@ -128,6 +131,7 @@ import plan from './commands/plan/index.js'
 import fast from './commands/fast/index.js'
 import passes from './commands/passes/index.js'
 import privacySettings from './commands/privacy-settings/index.js'
+import provider from './commands/provider/index.js'
 import hooks from './commands/hooks/index.js'
 import files from './commands/files/index.js'
 import branch from './commands/branch/index.js'
@@ -272,6 +276,7 @@ const COMMANDS = memoize((): Command[] => [
   contextNonInteractive,
   cost,
   diff,
+  dream,
   doctor,
   effort,
   exit,
@@ -288,9 +293,11 @@ const COMMANDS = memoize((): Command[] => [
   memory,
   mobile,
   model,
+  onboardGithub,
   outputStyle,
   remoteEnv,
   plugin,
+  provider,
   pr_comments,
   releaseNotes,
   reloadPlugins,

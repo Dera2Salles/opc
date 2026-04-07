@@ -1,4 +1,4 @@
-// biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+// biome-ignore-all assist/source/organizeImports: internal-only import markers must not be reordered
 /**
  * Ensure that any model codenames introduced here are also added to
  * scripts/excluded-strings.txt to avoid leaking them. Wrap any codename string
@@ -75,7 +75,17 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
     specifiedModel = modelOverride
   } else {
     const settings = getSettings_DEPRECATED() || {}
-    specifiedModel = process.env.ANTHROPIC_MODEL || process.env.GEMINI_MODEL || process.env.OPENAI_MODEL || settings.model || undefined
+    // Read the model env var that matches the active provider to prevent
+    // cross-provider leaks (e.g. ANTHROPIC_MODEL sent to the OpenAI API).
+    const provider = getAPIProvider()
+    specifiedModel =
+      (provider === 'gemini' ? process.env.GEMINI_MODEL : undefined) ||
+      (provider === 'openai' || provider === 'gemini' || provider === 'github'
+        ? process.env.OPENAI_MODEL
+        : undefined) ||
+      (provider === 'firstParty' ? process.env.ANTHROPIC_MODEL : undefined) ||
+      settings.model ||
+      undefined
   }
 
   // Ignore the user-specified model if it's not in the availableModels allowlist.
@@ -123,6 +133,10 @@ export function getDefaultOpusModel(): ModelName {
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o'
   }
+  // Codex provider: use user-specified model or default to gpt-5.4
+  if (getAPIProvider() === 'codex') {
+    return process.env.OPENAI_MODEL || 'gpt-5.4'
+  }
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // even when values match, since 3P availability lags firstParty and
   // these will diverge again at the next model launch.
@@ -145,6 +159,10 @@ export function getDefaultSonnetModel(): ModelName {
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o'
   }
+  // Codex provider
+  if (getAPIProvider() === 'codex') {
+    return process.env.OPENAI_MODEL || 'gpt-5.4'
+  }
   // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
   if (getAPIProvider() !== 'firstParty') {
     return getModelStrings().sonnet45
@@ -164,6 +182,10 @@ export function getDefaultHaikuModel(): ModelName {
   // OpenAI provider
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  }
+  // Codex provider
+  if (getAPIProvider() === 'codex') {
+    return process.env.OPENAI_MODEL || 'gpt-5.4'
   }
 
   // Haiku 4.5 is available on all platforms (first-party, Foundry, Bedrock, Vertex)
@@ -216,6 +238,14 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   // OpenAI provider: always use the configured OpenAI model
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o'
+  }
+  // GitHub provider: always use the configured GitHub model
+  if (getAPIProvider() === 'github') {
+    return process.env.OPENAI_MODEL || 'github:copilot'
+  }
+  // Codex provider: always use the configured Codex model (default gpt-5.4)
+  if (getAPIProvider() === 'codex') {
+    return process.env.OPENAI_MODEL || 'gpt-5.4'
   }
 
   // Ants default to defaultModel from flag config, or Opus 1M if not configured
@@ -343,12 +373,6 @@ export function renderDefaultModelSetting(
   if (setting === 'opusplan') {
     return 'Opus 4.6 in plan mode, else Sonnet 4.6'
   }
-  if (setting === 'codexplan') {
-    return 'Codex Plan (GPT-5.4 high reasoning)'
-  }
-  if (setting === 'codexspark') {
-    return 'Codex Spark (GPT-5.3 Codex Spark)'
-  }
   return renderModelName(parseUserSpecifiedModel(setting))
 }
 
@@ -383,11 +407,12 @@ export function renderModelSetting(setting: ModelName | ModelAlias): string {
   if (setting === 'opusplan') {
     return 'Opus Plan'
   }
+  // Handle Codex models - show actual model name + resolved model
   if (setting === 'codexplan') {
-    return 'Codex Plan'
+    return 'codexplan (gpt-5.4)'
   }
   if (setting === 'codexspark') {
-    return 'Codex Spark'
+    return 'codexspark (gpt-5.3-codex-spark)'
   }
   if (isModelAlias(setting)) {
     return capitalize(setting)
@@ -401,8 +426,8 @@ export function renderModelSetting(setting: ModelName | ModelAlias): string {
  * if the model is not recognized as a public model.
  */
 export function getPublicModelDisplayName(model: ModelName): string | null {
-  // For OpenAI/Gemini providers, show the actual model name not a Claude alias
-  if (getAPIProvider() === 'openai' || getAPIProvider() === 'gemini') {
+  // For OpenAI/Gemini/Codex providers, show the actual model name not a Claude alias
+  if (getAPIProvider() === 'openai' || getAPIProvider() === 'gemini' || getAPIProvider() === 'codex') {
     return null
   }
   switch (model) {
@@ -517,10 +542,6 @@ export function parseUserSpecifiedModel(
 
   if (isModelAlias(modelString)) {
     switch (modelString) {
-      case 'codexplan':
-        return modelInputTrimmed
-      case 'codexspark':
-        return modelInputTrimmed
       case 'opusplan':
         return getDefaultSonnetModel() + (has1mTag ? '[1m]' : '') // Sonnet is default, Opus in plan mode
       case 'sonnet':
@@ -533,6 +554,14 @@ export function parseUserSpecifiedModel(
         return getBestModel()
       default:
     }
+  }
+
+  // Handle Codex aliases - map to actual model names
+  if (modelString === 'codexplan') {
+    return 'gpt-5.4'
+  }
+  if (modelString === 'codexspark') {
+    return 'gpt-5.3-codex-spark'
   }
 
   // Opus 4/4.1 are no longer available on the first-party API (same as

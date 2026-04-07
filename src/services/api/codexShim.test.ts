@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -14,12 +14,19 @@ import {
 } from './providerConfig.js'
 
 const tempDirs: string[] = []
+const originalEnv = {
+  OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+  OPENAI_API_BASE: process.env.OPENAI_API_BASE,
+}
 
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()
     if (dir) rmSync(dir, { recursive: true, force: true })
   }
+
+  process.env.OPENAI_BASE_URL = originalEnv.OPENAI_BASE_URL
+  process.env.OPENAI_API_BASE = originalEnv.OPENAI_API_BASE
 })
 
 function createTempAuthJson(payload: Record<string, unknown>): string {
@@ -46,11 +53,61 @@ async function collectStreamEventTypes(responseText: string): Promise<string[]> 
 }
 
 describe('Codex provider config', () => {
+  const originalOpenaiBaseUrl = process.env.OPENAI_BASE_URL
+  const originalOpenaiApiBase = process.env.OPENAI_API_BASE
+
+  beforeEach(() => {
+    delete process.env.OPENAI_BASE_URL
+    delete process.env.OPENAI_API_BASE
+  })
+
+  afterEach(() => {
+    if (originalOpenaiBaseUrl === undefined) delete process.env.OPENAI_BASE_URL
+    else process.env.OPENAI_BASE_URL = originalOpenaiBaseUrl
+    if (originalOpenaiApiBase === undefined) delete process.env.OPENAI_API_BASE
+    else process.env.OPENAI_API_BASE = originalOpenaiApiBase
+  })
+
   test('resolves codexplan alias to Codex transport with reasoning', () => {
+    delete process.env.OPENAI_BASE_URL
+    delete process.env.OPENAI_API_BASE
+
     const resolved = resolveProviderRequest({ model: 'codexplan' })
     expect(resolved.transport).toBe('codex_responses')
     expect(resolved.resolvedModel).toBe('gpt-5.4')
     expect(resolved.reasoning).toEqual({ effort: 'high' })
+  })
+
+  test('does not force Codex transport when a local non-Codex base URL is explicit', () => {
+    const resolved = resolveProviderRequest({
+      model: 'codexplan',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+    })
+
+    expect(resolved.transport).toBe('chat_completions')
+    expect(resolved.baseUrl).toBe('http://127.0.0.1:8080/v1')
+    expect(resolved.resolvedModel).toBe('gpt-5.4')
+  })
+
+  test('resolves codexplan to Codex transport even when OPENAI_BASE_URL is the string "undefined"', () => {
+    // On Windows, env vars can leak as the literal string "undefined" instead of
+    // the JS value undefined when not properly unset (issue #336).
+    process.env.OPENAI_BASE_URL = 'undefined'
+    const resolved = resolveProviderRequest({ model: 'codexplan' })
+    expect(resolved.transport).toBe('codex_responses')
+  })
+
+  test('resolves codexplan to Codex transport even when OPENAI_BASE_URL is an empty string', () => {
+    process.env.OPENAI_BASE_URL = ''
+    const resolved = resolveProviderRequest({ model: 'codexplan' })
+    expect(resolved.transport).toBe('codex_responses')
+  })
+
+  test('prefers explicit baseUrl option over env var', () => {
+    process.env.OPENAI_BASE_URL = 'https://example.com/v1'
+    const resolved = resolveProviderRequest({ model: 'codexplan', baseUrl: 'https://chatgpt.com/backend-api/codex' })
+    expect(resolved.transport).toBe('codex_responses')
+    expect(resolved.baseUrl).toBe('https://chatgpt.com/backend-api/codex')
   })
 
   test('loads Codex credentials from auth.json fallback', () => {
@@ -72,7 +129,7 @@ describe('Codex provider config', () => {
 })
 
 describe('Codex request translation', () => {
-  test('disables strict mode for tools with optional parameters', () => {
+  test('normalizes optional parameters into strict Responses schemas', () => {
     const tools = convertToolsToResponsesTools([
       {
         name: 'Agent',
@@ -102,9 +159,10 @@ describe('Codex request translation', () => {
             prompt: { type: 'string' },
             subagent_type: { type: 'string' },
           },
-          required: ['description', 'prompt'],
+          required: ['description', 'prompt', 'subagent_type'],
           additionalProperties: false,
         },
+        strict: true,
       },
     ])
   })
@@ -136,6 +194,194 @@ describe('Codex request translation', () => {
             value: { type: 'string' },
           },
           required: ['value'],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ])
+  })
+
+  test('preserves Grep tool pattern field in Codex strict schemas', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'Grep',
+        description: 'Search file contents',
+        input_schema: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Search pattern' },
+            path: { type: 'string' },
+          },
+          required: ['pattern'],
+          additionalProperties: false,
+        },
+      },
+    ])
+
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        name: 'Grep',
+        description: 'Search file contents',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Search pattern' },
+            path: { type: 'string' },
+          },
+          required: ['pattern', 'path'],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ])
+  })
+
+  test('preserves Glob tool pattern field in Codex strict schemas', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'Glob',
+        description: 'Find files by pattern',
+        input_schema: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Glob pattern' },
+            path: { type: 'string' },
+          },
+          required: ['pattern'],
+          additionalProperties: false,
+        },
+      },
+    ])
+
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        name: 'Glob',
+        description: 'Find files by pattern',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Glob pattern' },
+            path: { type: 'string' },
+          },
+          required: ['pattern', 'path'],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ])
+  })
+
+  test('strips validator pattern keyword but keeps string field named pattern in Codex schemas', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'RegexProbe',
+        description: 'Probe regex schema handling',
+        input_schema: {
+          type: 'object',
+          properties: {
+            pattern: {
+              type: 'string',
+              pattern: '^[a-z]+$',
+            },
+          },
+          required: ['pattern'],
+          additionalProperties: false,
+        },
+      },
+    ])
+
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        name: 'RegexProbe',
+        description: 'Probe regex schema handling',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: {
+              type: 'string',
+            },
+          },
+          required: ['pattern'],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ])
+  })
+
+  test('removes unsupported uri format from strict Responses schemas', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'WebFetch',
+        description: 'Fetch a URL',
+        input_schema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', format: 'uri' },
+            prompt: { type: 'string' },
+          },
+          required: ['url', 'prompt'],
+          additionalProperties: false,
+        },
+      },
+    ])
+
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        name: 'WebFetch',
+        description: 'Fetch a URL',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: { type: 'string' },
+            prompt: { type: 'string' },
+          },
+          required: ['url', 'prompt'],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ])
+  })
+
+  test('sanitizes malformed enum/default values for Responses tool schemas', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__clientry__create_task',
+        description: 'Create a task',
+        input_schema: {
+          type: 'object',
+          properties: {
+            priority: {
+              type: 'integer',
+              description: 'Priority: 0=low, 1=medium, 2=high, 3=urgent',
+              default: true,
+              enum: [false, 0, 1, 2, 3],
+            },
+          },
+        },
+      },
+    ])
+
+    expect(tools).toEqual([
+      {
+        type: 'function',
+        name: 'mcp__clientry__create_task',
+        description: 'Create a task',
+        parameters: {
+          type: 'object',
+          properties: {
+            priority: {
+              type: 'integer',
+              description: 'Priority: 0=low, 1=medium, 2=high, 3=urgent',
+              enum: [0, 1, 2, 3],
+            },
+          },
+          required: ['priority'],
           additionalProperties: false,
         },
         strict: true,

@@ -14,20 +14,76 @@
  *   OPENAI_BASE_URL=http://...        — base URL (default: https://api.openai.com/v1)
  *   OPENAI_MODEL=gpt-4o              — default model override
  *   CODEX_API_KEY / ~/.codex/auth.json — Codex auth for codexplan/codexspark
+ *
+ * GitHub Models (models.github.ai), OpenAI-compatible:
+ *   CLAUDE_CODE_USE_GITHUB=1         — enable GitHub inference (no need for USE_OPENAI)
+ *   GITHUB_TOKEN or GH_TOKEN         — PAT with models access (mapped to Bearer auth)
+ *   OPENAI_MODEL                     — optional; use github:copilot or openai/gpt-4.1 style IDs
  */
 
+import { APIError } from '@anthropic-ai/sdk'
+import { isEnvTruthy } from '../../utils/envUtils.js'
+import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
+import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
+import { hydrateGithubModelsTokenFromSecureStorage } from '../../utils/githubModelsCredentials.js'
 import {
   codexStreamToAnthropic,
   collectCodexCompletedResponse,
   convertCodexResponseToAnthropicMessage,
   performCodexRequest,
   type AnthropicStreamEvent,
+  type AnthropicUsage,
   type ShimCreateParams,
 } from './codexShim.js'
 import {
+  isLocalProviderUrl,
   resolveCodexApiCredentials,
   resolveProviderRequest,
 } from './providerConfig.js'
+import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
+import { redactSecretValueForDisplay } from '../../utils/providerProfile.js'
+import {
+  normalizeToolArguments,
+  hasToolFieldMapping,
+} from './toolArgumentNormalization.js'
+
+type SecretValueSource = Partial<{
+  OPENAI_API_KEY: string
+  CODEX_API_KEY: string
+  GEMINI_API_KEY: string
+  GOOGLE_API_KEY: string
+  GEMINI_ACCESS_TOKEN: string
+}>
+
+const GITHUB_MODELS_DEFAULT_BASE = 'https://models.github.ai/inference'
+const GITHUB_API_VERSION = '2022-11-28'
+const GITHUB_429_MAX_RETRIES = 3
+const GITHUB_429_BASE_DELAY_SEC = 1
+const GITHUB_429_MAX_DELAY_SEC = 32
+const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
+
+function isGithubModelsMode(): boolean {
+  return isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
+}
+
+function hasGeminiApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === GEMINI_API_HOST
+  } catch {
+    return false
+  }
+}
+
+function formatRetryAfterHint(response: Response): string {
+  const ra = response.headers.get('retry-after')
+  return ra ? ` (Retry-After: ${ra})` : ''
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 // ---------------------------------------------------------------------------
 // Types — minimal subset of Anthropic SDK types we need to produce
@@ -44,6 +100,7 @@ interface OpenAIMessage {
     id: string
     type: 'function'
     function: { name: string; arguments: string }
+    extra_content?: Record<string, unknown>
   }>
   tool_call_id?: string
   name?: string
@@ -72,6 +129,37 @@ function convertSystemPrompt(
       .join('\n\n')
   }
   return String(system)
+}
+
+function convertToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return JSON.stringify(content ?? '')
+
+  const chunks: string[] = []
+  for (const block of content) {
+    if (block?.type === 'text' && typeof block.text === 'string') {
+      chunks.push(block.text)
+      continue
+    }
+
+    if (block?.type === 'image') {
+      const source = block.source
+      if (source?.type === 'url' && source.url) {
+        chunks.push(`[Image](${source.url})`)
+      } else if (source?.type === 'base64') {
+        chunks.push(`[image:${source.media_type ?? 'unknown'}]`)
+      } else {
+        chunks.push('[image]')
+      }
+      continue
+    }
+
+    if (typeof block?.text === 'string') {
+      chunks.push(block.text)
+    }
+  }
+
+  return chunks.join('\n')
 }
 
 function convertContentBlocks(
@@ -107,10 +195,12 @@ function convertContentBlocks(
         // handled separately
         break
       case 'thinking':
-        // Append thinking as text with a marker for models that support reasoning
-        if (block.thinking) {
-          parts.push({ type: 'text', text: `<thinking>${block.thinking}</thinking>` })
-        }
+      case 'redacted_thinking':
+        // Strip thinking blocks for OpenAI-compatible providers.
+        // These are Anthropic-specific content types that 3P providers
+        // don't understand. Serializing them as <thinking> text corrupts
+        // multi-turn context: the model sees the tags as part of its
+        // previous reply and may mimic or misattribute them.
         break
       default:
         if (block.text) {
@@ -122,6 +212,13 @@ function convertContentBlocks(
   if (parts.length === 0) return ''
   if (parts.length === 1 && parts[0].type === 'text') return parts[0].text ?? ''
   return parts
+}
+
+function isGeminiMode(): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
+    hasGeminiApiHost(process.env.OPENAI_BASE_URL)
+  )
 }
 
 function convertMessages(
@@ -150,11 +247,7 @@ function convertMessages(
 
         // Emit tool results as tool messages
         for (const tr of toolResults) {
-          const trContent = Array.isArray(tr.content)
-            ? tr.content.map((c: { text?: string }) => c.text ?? '').join('\n')
-            : typeof tr.content === 'string'
-              ? tr.content
-              : JSON.stringify(tr.content ?? '')
+          const trContent = convertToolResultContent(tr.content)
           result.push({
             role: 'tool',
             tool_call_id: tr.tool_use_id ?? 'unknown',
@@ -179,28 +272,66 @@ function convertMessages(
       // Check for tool_use blocks
       if (Array.isArray(content)) {
         const toolUses = content.filter((b: { type?: string }) => b.type === 'tool_use')
+        const thinkingBlock = content.find((b: { type?: string }) => b.type === 'thinking')
         const textContent = content.filter(
           (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
         )
 
         const assistantMsg: OpenAIMessage = {
           role: 'assistant',
-          content: convertContentBlocks(textContent) as string,
+          content: (() => {
+            const c = convertContentBlocks(textContent)
+            return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p.text ?? '').join('') : ''
+          })(),
         }
 
         if (toolUses.length > 0) {
           assistantMsg.tool_calls = toolUses.map(
-            (tu: { id?: string; name?: string; input?: unknown }) => ({
-              id: tu.id ?? `call_${Math.random().toString(36).slice(2)}`,
-              type: 'function' as const,
-              function: {
-                name: tu.name ?? 'unknown',
-                arguments:
-                  typeof tu.input === 'string'
-                    ? tu.input
-                    : JSON.stringify(tu.input ?? {}),
-              },
-            }),
+            (tu: {
+              id?: string
+              name?: string
+              input?: unknown
+              extra_content?: Record<string, unknown>
+              signature?: string
+            }, index) => {
+              const toolCall: NonNullable<OpenAIMessage['tool_calls']>[number] = {
+                id: tu.id ?? `call_${crypto.randomUUID().replace(/-/g, '')}`,
+                type: 'function' as const,
+                function: {
+                  name: tu.name ?? 'unknown',
+                  arguments:
+                    typeof tu.input === 'string'
+                      ? tu.input
+                      : JSON.stringify(tu.input ?? {}),
+                },
+              }
+
+              // Preserve existing extra_content if present
+              if (tu.extra_content) {
+                toolCall.extra_content = { ...tu.extra_content }
+              }
+
+              // Handle Gemini thought_signature
+              if (isGeminiMode()) {
+                // If the model provided a signature in the tool_use block itself (e.g. from a previous Turn/Step)
+                // Use thinkingBlock.signature for ALL tool calls in the same assistant turn if available.
+                // The API requires the same signature on every replayed function call part in a parallel set.
+                const signature = tu.signature ?? (thinkingBlock as any)?.signature
+
+                // Merge into existing google-specific metadata if present
+                const existingGoogle = (toolCall.extra_content?.google as Record<string, unknown>) ?? {}
+
+                toolCall.extra_content = {
+                  ...toolCall.extra_content,
+                  google: {
+                    ...existingGoogle,
+                    thought_signature: signature ?? "skip_thought_signature_validator"
+                  }
+                }
+              }
+
+              return toolCall
+            },
           )
         }
 
@@ -208,28 +339,144 @@ function convertMessages(
       } else {
         result.push({
           role: 'assistant',
-          content: convertContentBlocks(content) as string,
+          content: (() => {
+            const c = convertContentBlocks(content)
+            return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p.text ?? '').join('') : ''
+          })(),
         })
       }
     }
   }
 
-  return result
+  // Coalescing pass: merge consecutive messages of the same role.
+  // OpenAI/vLLM/Ollama require strict user↔assistant alternation.
+  // Multiple consecutive tool messages are allowed (assistant → tool* → user).
+  // Consecutive user or assistant messages must be merged to avoid Jinja
+  // template errors like "roles must alternate" (Devstral, Mistral models).
+  const coalesced: OpenAIMessage[] = []
+  for (const msg of result) {
+    const prev = coalesced[coalesced.length - 1]
+
+    if (prev && prev.role === msg.role && msg.role !== 'tool' && msg.role !== 'system') {
+      const prevContent = prev.content
+      const curContent = msg.content
+
+      if (typeof prevContent === 'string' && typeof curContent === 'string') {
+        prev.content = prevContent + (prevContent && curContent ? '\n' : '') + curContent
+      } else {
+        const toArray = (
+          c: string | Array<{ type: string; text?: string; image_url?: { url: string } }> | undefined,
+        ): Array<{ type: string; text?: string; image_url?: { url: string } }> => {
+          if (!c) return []
+          if (typeof c === 'string') return c ? [{ type: 'text', text: c }] : []
+          return c
+        }
+        prev.content = [...toArray(prevContent), ...toArray(curContent)]
+      }
+
+      if (msg.tool_calls?.length) {
+        prev.tool_calls = [...(prev.tool_calls ?? []), ...msg.tool_calls]
+      }
+    } else {
+      coalesced.push(msg)
+    }
+  }
+
+  return coalesced
+}
+
+/**
+ * OpenAI requires every key in `properties` to also appear in `required`.
+ * Anthropic schemas often mark fields as optional (omitted from `required`),
+ * which causes 400 errors on OpenAI/Codex endpoints. This normalizes the
+ * schema by ensuring `required` is a superset of `properties` keys.
+ */
+function normalizeSchemaForOpenAI(
+  schema: Record<string, unknown>,
+  strict = true,
+): Record<string, unknown> {
+  const record = sanitizeSchemaForOpenAICompat(schema)
+
+  if (record.type === 'object' && record.properties) {
+    const properties = record.properties as Record<string, Record<string, unknown>>
+    const existingRequired = Array.isArray(record.required) ? record.required as string[] : []
+
+    // Recurse into each property
+    const normalizedProps: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(properties)) {
+      normalizedProps[key] = normalizeSchemaForOpenAI(
+        value as Record<string, unknown>,
+        strict,
+      )
+    }
+    record.properties = normalizedProps
+
+    if (strict) {
+      // OpenAI strict mode requires every property to be listed in required[]
+      const allKeys = Object.keys(normalizedProps)
+      record.required = Array.from(new Set([...existingRequired, ...allKeys]))
+      // OpenAI strict mode requires additionalProperties: false on all object
+      // schemas — override unconditionally to ensure nested objects comply.
+      record.additionalProperties = false
+    } else {
+      // For Gemini: keep only existing required keys that are present in properties
+      record.required = existingRequired.filter(k => k in normalizedProps)
+    }
+  }
+
+  // Recurse into array items
+  if ('items' in record) {
+    if (Array.isArray(record.items)) {
+      record.items = (record.items as unknown[]).map(
+        item => normalizeSchemaForOpenAI(item as Record<string, unknown>, strict),
+      )
+    } else {
+      record.items = normalizeSchemaForOpenAI(record.items as Record<string, unknown>, strict)
+    }
+  }
+
+  // Recurse into combinators
+  for (const key of ['anyOf', 'oneOf', 'allOf'] as const) {
+    if (key in record && Array.isArray(record[key])) {
+      record[key] = (record[key] as unknown[]).map(
+        item => normalizeSchemaForOpenAI(item as Record<string, unknown>, strict),
+      )
+    }
+  }
+
+  return record
 }
 
 function convertTools(
   tools: Array<{ name: string; description?: string; input_schema?: Record<string, unknown> }>,
 ): OpenAITool[] {
+  const isGemini = isGeminiMode()
+
   return tools
     .filter(t => t.name !== 'ToolSearchTool') // Not relevant for OpenAI
-    .map(t => ({
-      type: 'function' as const,
-      function: {
-        name: t.name,
-        description: t.description ?? '',
-        parameters: t.input_schema ?? { type: 'object', properties: {} },
-      },
-    }))
+    .map(t => {
+      const schema = { ...(t.input_schema ?? { type: 'object', properties: {} }) } as Record<string, unknown>
+
+      // For Codex/OpenAI: promote known Agent sub-fields into required[] only if
+      // they actually exist in properties (Gemini rejects required keys absent from properties).
+      if (t.name === 'Agent' && schema.properties) {
+        const props = schema.properties as Record<string, unknown>
+        if (!Array.isArray(schema.required)) schema.required = []
+        const req = schema.required as string[]
+        for (const key of ['message', 'subagent_type']) {
+          if (key in props && !req.includes(key)) req.push(key)
+        }
+      }
+
+      return {
+        type: 'function' as const,
+        function: {
+          name: t.name,
+          description: t.description ?? '',
+          parameters: normalizeSchemaForOpenAI(schema, !isGemini),
+        },
+      }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -245,11 +492,13 @@ interface OpenAIStreamChunk {
     delta: {
       role?: string
       content?: string | null
+      reasoning_content?: string | null
       tool_calls?: Array<{
         index: number
         id?: string
         type?: string
         function?: { name?: string; arguments?: string }
+        extra_content?: Record<string, unknown>
       }>
     }
     finish_reason: string | null
@@ -258,11 +507,14 @@ interface OpenAIStreamChunk {
     prompt_tokens?: number
     completion_tokens?: number
     total_tokens?: number
+    prompt_tokens_details?: {
+      cached_tokens?: number
+    }
   }
 }
 
 function makeMessageId(): string {
-  return `msg_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+  return `msg_${crypto.randomUUID().replace(/-/g, '')}`
 }
 
 function convertChunkUsage(
@@ -274,7 +526,31 @@ function convertChunkUsage(
     input_tokens: usage.prompt_tokens ?? 0,
     output_tokens: usage.completion_tokens ?? 0,
     cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
+    cache_read_input_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+  }
+}
+
+const JSON_REPAIR_SUFFIXES = [
+  '}', '"}', ']}', '"]}', '}}', '"}}', ']}}', '"]}}', '"]}]}', '}]}'
+]
+
+function repairPossiblyTruncatedObjectJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? raw
+      : null
+  } catch {
+    for (const combo of JSON_REPAIR_SUFFIXES) {
+      try {
+        const repaired = raw + combo
+        const parsed = JSON.parse(repaired)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return repaired
+        }
+      } catch {}
+    }
+    return null
   }
 }
 
@@ -288,8 +564,19 @@ async function* openaiStreamToAnthropic(
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
-  const activeToolCalls = new Map<number, { id: string; name: string; index: number }>()
+  const activeToolCalls = new Map<
+    number,
+    {
+      id: string
+      name: string
+      index: number
+      jsonBuffer: string
+      normalizeAtStop: boolean
+    }
+  >()
   let hasEmittedContentStart = false
+  let hasEmittedThinkingStart = false
+  let hasClosedThinking = false
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
@@ -320,15 +607,16 @@ async function* openaiStreamToAnthropic(
   const decoder = new TextDecoder()
   let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
+      for (const line of lines) {
       const trimmed = line.trim()
       if (!trimmed || trimmed === 'data: [DONE]') continue
       if (!trimmed.startsWith('data: ')) continue
@@ -345,8 +633,34 @@ async function* openaiStreamToAnthropic(
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta
 
-        // Text content
-        if (delta.content) {
+        // Reasoning models (e.g. GLM-5, DeepSeek) may stream chain-of-thought
+        // in `reasoning_content` before the actual reply appears in `content`.
+        // Emit reasoning as a thinking block and content as a text block.
+        if (delta.reasoning_content != null && delta.reasoning_content !== '') {
+          if (!hasEmittedThinkingStart) {
+            yield {
+              type: 'content_block_start',
+              index: contentBlockIndex,
+              content_block: { type: 'thinking', thinking: '' },
+            }
+            hasEmittedThinkingStart = true
+          }
+          yield {
+            type: 'content_block_delta',
+            index: contentBlockIndex,
+            delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+          }
+        }
+
+        // Text content — use != null to distinguish absent field from empty string,
+        // some providers send "" as first delta to signal streaming start
+        if (delta.content != null && delta.content !== '') {
+          // Close thinking block if transitioning from reasoning to content
+          if (hasEmittedThinkingStart && !hasClosedThinking) {
+            yield { type: 'content_block_stop', index: contentBlockIndex }
+            contentBlockIndex++
+            hasClosedThinking = true
+          }
           if (!hasEmittedContentStart) {
             yield {
               type: 'content_block_start',
@@ -366,7 +680,12 @@ async function* openaiStreamToAnthropic(
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             if (tc.id && tc.function?.name) {
-              // New tool call starting
+              // New tool call starting — close any open thinking block first
+              if (hasEmittedThinkingStart && !hasClosedThinking) {
+                yield { type: 'content_block_stop', index: contentBlockIndex }
+                contentBlockIndex++
+                hasClosedThinking = true
+              }
               if (hasEmittedContentStart) {
                 yield {
                   type: 'content_block_stop',
@@ -377,10 +696,14 @@ async function* openaiStreamToAnthropic(
               }
 
               const toolBlockIndex = contentBlockIndex
+              const initialArguments = tc.function.arguments ?? ''
+              const normalizeAtStop = hasToolFieldMapping(tc.function.name)
               activeToolCalls.set(tc.index, {
                 id: tc.id,
                 name: tc.function.name,
                 index: toolBlockIndex,
+                jsonBuffer: initialArguments,
+                normalizeAtStop,
               })
 
               yield {
@@ -391,12 +714,20 @@ async function* openaiStreamToAnthropic(
                   id: tc.id,
                   name: tc.function.name,
                   input: {},
+                  ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
+                  // Extract Gemini signature from extra_content
+                  ...((tc.extra_content?.google as any)?.thought_signature
+                    ? {
+                        signature: (tc.extra_content.google as any)
+                          .thought_signature,
+                      }
+                    : {}),
                 },
               }
               contentBlockIndex++
 
               // Emit any initial arguments
-              if (tc.function.arguments) {
+              if (tc.function.arguments && !normalizeAtStop) {
                 yield {
                   type: 'content_block_delta',
                   index: toolBlockIndex,
@@ -410,6 +741,14 @@ async function* openaiStreamToAnthropic(
               // Continuation of existing tool call
               const active = activeToolCalls.get(tc.index)
               if (active) {
+                if (tc.function.arguments) {
+                  active.jsonBuffer += tc.function.arguments
+                }
+
+                if (active.normalizeAtStop) {
+                  continue
+                }
+
                 yield {
                   type: 'content_block_delta',
                   index: active.index,
@@ -428,6 +767,12 @@ async function* openaiStreamToAnthropic(
         if (choice.finish_reason && !hasProcessedFinishReason) {
           hasProcessedFinishReason = true
 
+          // Close any open thinking block that wasn't closed by content transition
+          if (hasEmittedThinkingStart && !hasClosedThinking) {
+            yield { type: 'content_block_stop', index: contentBlockIndex }
+            contentBlockIndex++
+            hasClosedThinking = true
+          }
           // Close any open content blocks
           if (hasEmittedContentStart) {
             yield {
@@ -437,6 +782,64 @@ async function* openaiStreamToAnthropic(
           }
           // Close active tool calls
           for (const [, tc] of activeToolCalls) {
+            if (tc.normalizeAtStop) {
+              let partialJson: string
+              if (choice.finish_reason === 'length') {
+                // Truncated by max tokens — preserve raw buffer to avoid
+                // turning an incomplete tool call into an executable command
+                partialJson = tc.jsonBuffer
+              } else {
+                const repairedStructuredJson = repairPossiblyTruncatedObjectJson(
+                  tc.jsonBuffer,
+                )
+                if (repairedStructuredJson) {
+                  partialJson = repairedStructuredJson
+                } else {
+                  partialJson = JSON.stringify(
+                    normalizeToolArguments(tc.name, tc.jsonBuffer),
+                  )
+                }
+              }
+
+              yield {
+                type: 'content_block_delta',
+                index: tc.index,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: partialJson,
+                },
+              }
+              yield { type: 'content_block_stop', index: tc.index }
+              continue
+            }
+
+            let suffixToAdd = ''
+            if (tc.jsonBuffer) {
+              try {
+                JSON.parse(tc.jsonBuffer)
+              } catch {
+                const str = tc.jsonBuffer.trimEnd()
+                for (const combo of JSON_REPAIR_SUFFIXES) {
+                  try {
+                    JSON.parse(str + combo)
+                    suffixToAdd = combo
+                    break
+                  } catch {}
+                }
+              }
+            }
+
+            if (suffixToAdd) {
+              yield {
+                type: 'content_block_delta',
+                index: tc.index,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: suffixToAdd,
+                },
+              }
+            }
+
             yield { type: 'content_block_stop', index: tc.index }
           }
 
@@ -446,6 +849,23 @@ async function* openaiStreamToAnthropic(
               : choice.finish_reason === 'length'
                 ? 'max_tokens'
                 : 'end_turn'
+          if (choice.finish_reason === 'content_filter' || choice.finish_reason === 'safety') {
+            // Gemini/Azure content safety filter blocked the response.
+            // Emit a visible text block so the user knows why output was truncated.
+            if (!hasEmittedContentStart) {
+              yield {
+                type: 'content_block_start',
+                index: contentBlockIndex,
+                content_block: { type: 'text', text: '' },
+              }
+              hasEmittedContentStart = true
+            }
+            yield {
+              type: 'content_block_delta',
+              index: contentBlockIndex,
+              delta: { type: 'text_delta', text: '\n\n[Content blocked by provider safety filter]' },
+            }
+          }
           lastStopReason = stopReason
 
           yield {
@@ -462,7 +882,8 @@ async function* openaiStreamToAnthropic(
       if (
         !hasEmittedFinalUsage &&
         chunkUsage &&
-        (chunk.choices?.length ?? 0) === 0
+        (chunk.choices?.length ?? 0) === 0 &&
+        lastStopReason !== null
       ) {
         yield {
           type: 'message_delta',
@@ -472,6 +893,9 @@ async function* openaiStreamToAnthropic(
         hasEmittedFinalUsage = true
       }
     }
+    }
+  } finally {
+    reader.releaseLock()
   }
 
   yield { type: 'message_stop' }
@@ -497,9 +921,13 @@ class OpenAIShimStream {
 
 class OpenAIShimMessages {
   private defaultHeaders: Record<string, string>
+  private reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  private providerOverride?: { model: string; baseURL: string; apiKey: string }
 
-  constructor(defaultHeaders: Record<string, string>) {
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
     this.defaultHeaders = defaultHeaders
+    this.reasoningEffort = reasoningEffort
+    this.providerOverride = providerOverride
   }
 
   create(
@@ -508,9 +936,12 @@ class OpenAIShimMessages {
   ) {
     const self = this
 
+    let httpResponse: Response | undefined
+
     const promise = (async () => {
-      const request = resolveProviderRequest({ model: params.model })
+      const request = resolveProviderRequest({ model: self.providerOverride?.model ?? params.model, baseUrl: self.providerOverride?.baseURL, reasoningEffortOverride: self.reasoningEffort })
       const response = await self._doRequest(request, params, options)
+      httpResponse = response
 
       if (params.stream) {
         return new OpenAIShimStream(
@@ -532,15 +963,16 @@ class OpenAIShimMessages {
       return self._convertNonStreamingResponse(data, request.resolvedModel)
     })()
 
-    ;(promise as unknown as Record<string, unknown>).withResponse =
-      async () => {
-        const data = await promise
-        return {
-          data,
-          response: new Response(),
-          request_id: makeMessageId(),
+      ; (promise as unknown as Record<string, unknown>).withResponse =
+        async () => {
+          const data = await promise
+          return {
+            data,
+            response: httpResponse ?? new Response(),
+            request_id:
+              httpResponse?.headers.get('x-request-id') ?? makeMessageId(),
+          }
         }
-      }
 
     return promise
   }
@@ -556,8 +988,11 @@ class OpenAIShimMessages {
         const authHint = credentials.authPath
           ? ` or place a Codex auth.json at ${credentials.authPath}`
           : ''
+        const safeModel =
+          redactSecretValueForDisplay(request.requestedModel, process.env as SecretValueSource) ??
+          'the requested model'
         throw new Error(
-          `Codex auth is required for ${request.requestedModel}. Set CODEX_API_KEY${authHint}.`,
+          `Codex auth is required for ${safeModel}. Set CODEX_API_KEY${authHint}.`,
         )
       }
       if (!credentials.accountId) {
@@ -598,12 +1033,32 @@ class OpenAIShimMessages {
     const body: Record<string, unknown> = {
       model: request.resolvedModel,
       messages: openaiMessages,
-      max_tokens: params.max_tokens,
       stream: params.stream ?? false,
     }
+    // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
+    // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
+    // Ensure max_tokens is a valid positive number before using it.
+    const maxTokensValue = typeof params.max_tokens === 'number' && params.max_tokens > 0
+      ? params.max_tokens
+      : undefined
+    const maxCompletionTokensValue = typeof (params as Record<string, unknown>).max_completion_tokens === 'number'
+      ? (params as Record<string, unknown>).max_completion_tokens as number
+      : undefined
 
-    if (params.stream) {
+    if (maxTokensValue !== undefined) {
+      body.max_completion_tokens = maxTokensValue
+    } else if (maxCompletionTokensValue !== undefined) {
+      body.max_completion_tokens = maxCompletionTokensValue
+    }
+
+    if (params.stream && !isLocalProviderUrl(request.baseUrl)) {
       body.stream_options = { include_usage: true }
+    }
+
+    const isGithub = isGithubModelsMode()
+    if (isGithub && body.max_completion_tokens !== undefined) {
+      body.max_tokens = body.max_completion_tokens
+      delete body.max_completion_tokens
     }
 
     if (params.temperature !== undefined) body.temperature = params.temperature
@@ -630,6 +1085,8 @@ class OpenAIShimMessages {
             }
           } else if (tc.type === 'any') {
             body.tool_choice = 'required'
+          } else if (tc.type === 'none') {
+            body.tool_choice = 'none'
           }
         }
       }
@@ -641,24 +1098,106 @@ class OpenAIShimMessages {
       ...(options?.headers ?? {}),
     }
 
-    const apiKey = process.env.OPENAI_API_KEY ?? ''
+    const isGemini = isGeminiMode()
+    const apiKey =
+      this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
+    // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
+    // path segments like https://evil.com/cognitiveservices.azure.com/
+    let isAzure = false
+    try {
+      const { hostname } = new URL(request.baseUrl)
+      isAzure = hostname.endsWith('.azure.com') &&
+        (hostname.includes('cognitiveservices') || hostname.includes('openai') || hostname.includes('services.ai'))
+    } catch { /* malformed URL — not Azure */ }
+
     if (apiKey) {
-      headers.Authorization = `Bearer ${apiKey}`
+      if (isAzure) {
+        // Azure uses api-key header instead of Bearer token
+        headers['api-key'] = apiKey
+      } else {
+        headers.Authorization = `Bearer ${apiKey}`
+      }
+    } else if (isGemini) {
+      const geminiCredential = await resolveGeminiCredential(process.env)
+      if (geminiCredential.kind !== 'none') {
+        headers.Authorization = `Bearer ${geminiCredential.credential}`
+        if (geminiCredential.projectId) {
+          headers['x-goog-user-project'] = geminiCredential.projectId
+        }
+      }
     }
 
-    const response = await fetch(`${request.baseUrl}/chat/completions`, {
-      method: 'POST',
+    if (isGithub) {
+      headers.Accept = 'application/vnd.github.v3+json'
+      headers['X-GitHub-Api-Version'] = GITHUB_API_VERSION
+    }
+
+    // Build the chat completions URL
+    // Azure Cognitive Services / Azure OpenAI require a deployment-specific path
+    // and an api-version query parameter.
+    // Standard format: {base}/openai/deployments/{model}/chat/completions?api-version={version}
+    // Non-Azure: {base}/chat/completions
+    let chatCompletionsUrl: string
+    if (isAzure) {
+      const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
+      const deployment = request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o'
+      // If base URL already contains /deployments/, use it as-is with api-version
+      if (/\/deployments\//i.test(request.baseUrl)) {
+        const base = request.baseUrl.replace(/\/+$/, '')
+        chatCompletionsUrl = `${base}/chat/completions?api-version=${apiVersion}`
+      } else {
+        // Strip trailing /v1 or /openai/v1 if present, then build Azure path
+        const base = request.baseUrl.replace(/\/(openai\/)?v1\/?$/, '').replace(/\/+$/, '')
+        chatCompletionsUrl = `${base}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`
+      }
+    } else {
+      chatCompletionsUrl = `${request.baseUrl}/chat/completions`
+    }
+
+    const fetchInit = {
+      method: 'POST' as const,
       headers,
       body: JSON.stringify(body),
       signal: options?.signal,
-    })
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => 'unknown error')
-      throw new Error(`OpenAI API error ${response.status}: ${errorBody}`)
     }
 
-    return response
+    const maxAttempts = isGithub ? GITHUB_429_MAX_RETRIES : 1
+    let response: Response | undefined
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      response = await fetch(chatCompletionsUrl, fetchInit)
+      if (response.ok) {
+        return response
+      }
+      if (
+        isGithub &&
+        response.status === 429 &&
+        attempt < maxAttempts - 1
+      ) {
+        await response.text().catch(() => {})
+        const delaySec = Math.min(
+          GITHUB_429_BASE_DELAY_SEC * 2 ** attempt,
+          GITHUB_429_MAX_DELAY_SEC,
+        )
+        await sleepMs(delaySec * 1000)
+        continue
+      }
+      const errorBody = await response.text().catch(() => 'unknown error')
+      const rateHint =
+        isGithub && response.status === 429 ? formatRetryAfterHint(response) : ''
+      let errorResponse: object | undefined
+      try { errorResponse = JSON.parse(errorBody) } catch { /* raw text */ }
+      throw APIError.generate(
+        response.status,
+        errorResponse,
+        `OpenAI API error ${response.status}: ${errorBody}${rateHint}`,
+        response.headers as unknown as Headers,
+      )
+    }
+
+    throw APIError.generate(
+      500, undefined, 'OpenAI shim: request loop exited unexpectedly',
+      new Headers(),
+    )
   }
 
   private _convertNonStreamingResponse(
@@ -668,10 +1207,15 @@ class OpenAIShimMessages {
       choices?: Array<{
         message?: {
           role?: string
-          content?: string | null
+          content?:
+            | string
+            | null
+            | Array<{ type?: string; text?: string }>
+          reasoning_content?: string | null
           tool_calls?: Array<{
             id: string
             function: { name: string; arguments: string }
+            extra_content?: Record<string, unknown>
           }>
         }
         finish_reason?: string
@@ -679,6 +1223,9 @@ class OpenAIShimMessages {
       usage?: {
         prompt_tokens?: number
         completion_tokens?: number
+        prompt_tokens_details?: {
+          cached_tokens?: number
+        }
       }
     },
     model: string,
@@ -686,23 +1233,53 @@ class OpenAIShimMessages {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
 
-    if (choice?.message?.content) {
-      content.push({ type: 'text', text: choice.message.content })
+    // Some reasoning models (e.g. GLM-5) put their reply in reasoning_content
+    // while content stays null — emit reasoning as a thinking block, then
+    // fall back to it for visible text if content is empty.
+    const reasoningText = choice?.message?.reasoning_content
+    if (typeof reasoningText === 'string' && reasoningText) {
+      content.push({ type: 'thinking', thinking: reasoningText })
+    }
+    const rawContent =
+      choice?.message?.content !== '' && choice?.message?.content != null
+        ? choice?.message?.content
+        : choice?.message?.reasoning_content
+    if (typeof rawContent === 'string' && rawContent) {
+      content.push({ type: 'text', text: rawContent })
+    } else if (Array.isArray(rawContent) && rawContent.length > 0) {
+      const parts: string[] = []
+      for (const part of rawContent) {
+        if (
+          part &&
+          typeof part === 'object' &&
+          part.type === 'text' &&
+          typeof part.text === 'string'
+        ) {
+          parts.push(part.text)
+        }
+      }
+      const joined = parts.join('\n')
+      if (joined) {
+        content.push({ type: 'text', text: joined })
+      }
     }
 
     if (choice?.message?.tool_calls) {
       for (const tc of choice.message.tool_calls) {
-        let input: unknown
-        try {
-          input = JSON.parse(tc.function.arguments)
-        } catch {
-          input = { raw: tc.function.arguments }
-        }
+        const input = normalizeToolArguments(
+          tc.function.name,
+          tc.function.arguments,
+        )
         content.push({
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
           input,
+          ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
+          // Extract Gemini signature from extra_content
+          ...((tc.extra_content?.google as any)?.thought_signature
+            ? { signature: (tc.extra_content.google as any).thought_signature }
+            : {}),
         })
       }
     }
@@ -713,6 +1290,13 @@ class OpenAIShimMessages {
         : choice?.finish_reason === 'length'
           ? 'max_tokens'
           : 'end_turn'
+
+    if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
+      content.push({
+        type: 'text',
+        text: '\n\n[Content blocked by provider safety filter]',
+      })
+    }
 
     return {
       id: data.id ?? makeMessageId(),
@@ -726,7 +1310,7 @@ class OpenAIShimMessages {
         input_tokens: data.usage?.prompt_tokens ?? 0,
         output_tokens: data.usage?.completion_tokens ?? 0,
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
       },
     }
   }
@@ -734,9 +1318,11 @@ class OpenAIShimMessages {
 
 class OpenAIShimBeta {
   messages: OpenAIShimMessages
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
 
-  constructor(defaultHeaders: Record<string, string>) {
-    this.messages = new OpenAIShimMessages(defaultHeaders)
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
+    this.messages = new OpenAIShimMessages(defaultHeaders, reasoningEffort, providerOverride)
+    this.reasoningEffort = reasoningEffort
   }
 }
 
@@ -744,26 +1330,35 @@ export function createOpenAIShimClient(options: {
   defaultHeaders?: Record<string, string>
   maxRetries?: number
   timeout?: number
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  providerOverride?: { model: string; baseURL: string; apiKey: string }
 }): unknown {
+  hydrateGeminiAccessTokenFromSecureStorage()
+  hydrateGithubModelsTokenFromSecureStorage()
+
   // When Gemini provider is active, map Gemini env vars to OpenAI-compatible ones
   // so the existing providerConfig.ts infrastructure picks them up correctly.
-  if (
-    process.env.CLAUDE_CODE_USE_GEMINI === '1' ||
-    process.env.CLAUDE_CODE_USE_GEMINI === 'true'
-  ) {
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
     process.env.OPENAI_BASE_URL ??=
       process.env.GEMINI_BASE_URL ??
       'https://generativelanguage.googleapis.com/v1beta/openai'
-    process.env.OPENAI_API_KEY ??=
-      process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY ?? ''
+    const geminiApiKey =
+      process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
+    if (geminiApiKey && !process.env.OPENAI_API_KEY) {
+      process.env.OPENAI_API_KEY = geminiApiKey
+    }
     if (process.env.GEMINI_MODEL && !process.env.OPENAI_MODEL) {
       process.env.OPENAI_MODEL = process.env.GEMINI_MODEL
     }
+  } else if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)) {
+    process.env.OPENAI_BASE_URL ??= GITHUB_MODELS_DEFAULT_BASE
+    process.env.OPENAI_API_KEY ??=
+      process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? ''
   }
 
   const beta = new OpenAIShimBeta({
     ...(options.defaultHeaders ?? {}),
-  })
+  }, options.reasoningEffort, options.providerOverride)
 
   return {
     beta,
